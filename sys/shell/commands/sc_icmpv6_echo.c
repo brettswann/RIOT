@@ -38,9 +38,10 @@ static char ipv6_str[IPV6_ADDR_MAX_STR_LEN];
 
 static void usage(char **argv)
 {
-    printf("%s [<count>] <ipv6 addr> [<payload_len>] [<delay in ms>] [<stats interval>]\n", argv[0]);
+    printf("%s [<count>] <ipv6 addr>[%%<interface>] [<payload_len>] [<delay in ms>] [<stats interval>]\n", argv[0]);
     puts("defaults:");
     puts("    count = 3");
+    puts("    interface = first interface if only one present, only needed for link-local addresses");
     puts("    payload_len = 4");
     puts("    delay = 1000");
     puts("    stats interval = count");
@@ -85,8 +86,8 @@ int _handle_reply(gnrc_pktsnip_t *pkt, uint32_t time)
     icmpv6_echo_t *icmpv6_hdr;
     uint16_t seq;
 
-    LL_SEARCH_SCALAR(pkt, ipv6, type, GNRC_NETTYPE_IPV6);
-    LL_SEARCH_SCALAR(pkt, icmpv6, type, GNRC_NETTYPE_ICMPV6);
+    ipv6 = gnrc_pktsnip_search_type(pkt, GNRC_NETTYPE_IPV6);
+    icmpv6 = gnrc_pktsnip_search_type(pkt, GNRC_NETTYPE_ICMPV6);
 
     if ((ipv6 == NULL) || (icmpv6 == NULL)) {
         puts("error: IPv6 header or ICMPv6 header not found in reply");
@@ -107,7 +108,9 @@ int _handle_reply(gnrc_pktsnip_t *pkt, uint32_t time)
                ipv6_addr_to_str(ipv6_str, &(ipv6_hdr->src), sizeof(ipv6_str)),
                byteorder_ntohs(icmpv6_hdr->id), seq, (unsigned)ipv6_hdr->hl,
                time / MS_IN_USEC, time % MS_IN_USEC);
+#ifdef MODULE_GNRC_IPV6_NC
         gnrc_ipv6_nc_still_reachable(&ipv6_hdr->src);
+#endif
     }
     else {
         puts("error: unexpected parameters");
@@ -123,7 +126,7 @@ static void _print_stats(char *addr_str, int success, int count, uint64_t total_
     printf("--- %s ping statistics ---\n", addr_str);
 
     if (success > 0) {
-        uint32_t avg_rtt = (uint32_t)sum_rtt / count;  /* get average */
+        uint32_t avg_rtt = (uint32_t)(sum_rtt / count); /* get average */
         printf("%d packets transmitted, %d received, %d%% packet loss, time %"
                PRIu32 ".06%" PRIu32 " s\n", count, success,
                (100 - ((success * 100) / count)),
@@ -148,6 +151,7 @@ int _icmpv6_ping(int argc, char **argv)
     uint32_t delay = 1 * SEC_IN_MS;
     char *addr_str;
     ipv6_addr_t addr;
+    kernel_pid_t src_iface;
     msg_t msg;
     gnrc_netreg_entry_t *ipv6_entry, my_entry = { NULL, ICMPV6_ECHO_REP,
                                                   thread_getpid() };
@@ -170,7 +174,6 @@ int _icmpv6_ping(int argc, char **argv)
     stat_interval = count;
 
     addr_str = argv[1 + param_offset];
-
     if (argc > (2 + param_offset)) {
         payload_len = atoi(argv[2 + param_offset]);
     }
@@ -186,9 +189,41 @@ int _icmpv6_ping(int argc, char **argv)
         return 1;
     }
 
+    src_iface = ipv6_addr_split_iface(addr_str);
+    if (src_iface == -1) {
+        src_iface = KERNEL_PID_UNDEF;
+    }
+
     if (ipv6_addr_from_str(&addr, addr_str) == NULL) {
         puts("error: malformed address");
         return 1;
+    }
+
+    if (ipv6_addr_is_link_local(&addr) || (src_iface != KERNEL_PID_UNDEF)) {
+        kernel_pid_t ifs[GNRC_NETIF_NUMOF];
+        size_t ifnum = gnrc_netif_get(ifs);
+        if (src_iface == KERNEL_PID_UNDEF) {
+            if (ifnum == 1) {
+                src_iface = ifs[0];
+            }
+            else {
+                puts("error: link local target needs interface parameter (use \"<address>%<ifnum>\")\n");
+                return 1;
+            }
+        }
+        else {
+            int valid = 0;
+            for (size_t i = 0; i < ifnum && i < GNRC_NETIF_NUMOF; i++) {
+                if (ifs[i] == src_iface) {
+                    valid = 1;
+                    break;
+                }
+            }
+            if (!valid) {
+                printf("error: %"PRIkernel_pid" is not a valid interface.\n", src_iface);
+                return 1;
+            }
+        }
     }
 
     if (gnrc_netreg_register(GNRC_NETTYPE_ICMPV6, &my_entry) < 0) {
@@ -221,12 +256,24 @@ int _icmpv6_ping(int argc, char **argv)
 
         _set_payload(pkt->data, payload_len);
 
-        pkt = gnrc_netreg_hdr_build(GNRC_NETTYPE_IPV6, pkt, NULL, 0, addr.u8,
-                                    sizeof(ipv6_addr_t));
+        pkt = gnrc_ipv6_hdr_build(pkt, NULL, &addr);
 
         if (pkt == NULL) {
             puts("error: packet buffer full");
             continue;
+        }
+
+        if (src_iface != KERNEL_PID_UNDEF) {
+            pkt = gnrc_pktbuf_add(pkt, NULL, sizeof(gnrc_netif_hdr_t),
+                                  GNRC_NETTYPE_NETIF);
+
+            if (pkt == NULL) {
+                puts("error: packet buffer full");
+                continue;
+            }
+
+            gnrc_netif_hdr_init(((gnrc_netif_hdr_t *)pkt->data), 0, 0);
+            ((gnrc_netif_hdr_t *)pkt->data)->if_pid = src_iface;
         }
 
         start = xtimer_now();

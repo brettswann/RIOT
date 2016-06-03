@@ -36,9 +36,10 @@ static void _callback_unlock_mutex(void* arg)
 
 void _xtimer_sleep(uint32_t offset, uint32_t long_offset)
 {
-    if (inISR()) {
+    if (irq_is_in()) {
         assert(!long_offset);
         xtimer_spin(offset);
+        return;
     }
 
     xtimer_t timer;

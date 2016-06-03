@@ -32,6 +32,7 @@
 #include "net/gnrc/ipv6/nc.h"
 #include "net/gnrc/ipv6/netif.h"
 #include "net/gnrc/ipv6/whitelist.h"
+#include "net/gnrc/ipv6/blacklist.h"
 
 #include "net/gnrc/ipv6.h"
 
@@ -68,9 +69,6 @@ kernel_pid_t gnrc_ipv6_pid = KERNEL_PID_UNDEF;
 
 /* handles GNRC_NETAPI_MSG_TYPE_RCV commands */
 static void _receive(gnrc_pktsnip_t *pkt);
-/* dispatches received IPv6 packet for upper layer */
-static void _dispatch_rcv_pkt(gnrc_nettype_t type, uint32_t demux_ctx,
-                              gnrc_pktsnip_t *pkt);
 /* Sends packet over the appropriate interface(s).
  * prep_hdr: prepare header for sending (call to _fill_ipv6_hdr()), otherwise
  * assume it is already prepared */
@@ -99,17 +97,26 @@ kernel_pid_t gnrc_ipv6_init(void)
     return gnrc_ipv6_pid;
 }
 
-void gnrc_ipv6_demux(kernel_pid_t iface, gnrc_pktsnip_t *pkt, uint8_t nh)
-{
-    int receiver_num;
+static void _dispatch_next_header(gnrc_pktsnip_t *current, gnrc_pktsnip_t *pkt,
+                                  uint8_t nh, bool interested);
 
-    pkt->type = gnrc_nettype_from_protnum(nh);
+/*
+ *         current                 pkt
+ *         |                       |
+ *         v                       v
+ * IPv6 <- IPv6_EXT <- IPv6_EXT <- UNDEF
+ */
+void gnrc_ipv6_demux(kernel_pid_t iface, gnrc_pktsnip_t *current, gnrc_pktsnip_t *pkt, uint8_t nh)
+{
+    bool interested = false;
+
+    current->type = gnrc_nettype_from_protnum(nh);
 
     switch (nh) {
 #ifdef MODULE_GNRC_ICMPV6
         case PROTNUM_ICMPV6:
-            DEBUG("ipv6: handle ICMPv6 packet (nh = %" PRIu8 ")\n", nh);
-            gnrc_icmpv6_demux(iface, pkt);
+            assert(current == pkt);
+            interested = true;
             break;
 #endif
 #ifdef MODULE_GNRC_IPV6_EXT
@@ -120,42 +127,117 @@ void gnrc_ipv6_demux(kernel_pid_t iface, gnrc_pktsnip_t *pkt, uint8_t nh)
         case PROTNUM_IPV6_EXT_AH:
         case PROTNUM_IPV6_EXT_ESP:
         case PROTNUM_IPV6_EXT_MOB:
-            DEBUG("ipv6: handle extension header (nh = %" PRIu8 ")\n", nh);
-            if (!gnrc_ipv6_ext_demux(iface, pkt, nh)) {
-                DEBUG("ipv6: unable to parse extension headers.\n");
-                gnrc_pktbuf_release(pkt);
-                return;
-            }
+            interested = true;
+
+            break;
 #endif
         case PROTNUM_IPV6:
-            DEBUG("ipv6: handle encapsulated IPv6 packet (nh = %" PRIu8 ")\n", nh);
-            _decapsulate(pkt);
+            assert(current == pkt);
+            interested = true;
+
             break;
         default:
             (void)iface;
+#ifdef MODULE_GNRC_SIXLOWPAN_IPHC_NHC
+            /* second statement is true for small 6LoWPAN NHC decompressed frames
+             * since in this case it looks like
+             *
+             * * GNRC_NETTYPE_UNDEF <- pkt
+             * v
+             * * GNRC_NETTYPE_UDP <- current
+             * v
+             * * GNRC_NETTYPE_EXT
+             * v
+             * * GNRC_NETTYPE_IPV6
+             */
+            assert((current == pkt) || (current == pkt->next));
+#else
+            assert(current == pkt);
+#endif
             break;
     }
 
-    DEBUG("ipv6: forward nh = %" PRIu8 " to other threads\n", nh);
-    receiver_num = gnrc_netreg_num(pkt->type, GNRC_NETREG_DEMUX_CTX_ALL) +
-                   gnrc_netreg_num(GNRC_NETTYPE_IPV6, nh);
+    _dispatch_next_header(current, pkt, nh, interested);
 
-    if (receiver_num == 0) {
-        DEBUG("ipv6: unable to forward packet as no one is interested in it\n");
-        gnrc_pktbuf_release(pkt);
+    if (!interested) {
         return;
     }
 
-    gnrc_pktbuf_hold(pkt, receiver_num - 1);    /* IPv6 is not interested anymore so `- 1` */
+    switch (nh) {
+#ifdef MODULE_GNRC_ICMPV6
+        case PROTNUM_ICMPV6:
+            DEBUG("ipv6: handle ICMPv6 packet (nh = %u)\n", nh);
+            gnrc_icmpv6_demux(iface, pkt);
+            gnrc_pktbuf_release(pkt);
+            return;
+#endif
+#ifdef MODULE_GNRC_IPV6_EXT
+        case PROTNUM_IPV6_EXT_HOPOPT:
+        case PROTNUM_IPV6_EXT_DST:
+        case PROTNUM_IPV6_EXT_RH:
+        case PROTNUM_IPV6_EXT_FRAG:
+        case PROTNUM_IPV6_EXT_AH:
+        case PROTNUM_IPV6_EXT_ESP:
+        case PROTNUM_IPV6_EXT_MOB:
+            DEBUG("ipv6: handle extension header (nh = %u)\n", nh);
 
-    /* XXX can't use gnrc_netapi_dispatch_receive() twice here since a call to that function
-     *     implicitly hands all rights to the packet to one of the receiving threads. As a result,
-     *     the second call to gnrc_netapi_dispatch_receive() would be invalid */
-    _dispatch_rcv_pkt(pkt->type, GNRC_NETREG_DEMUX_CTX_ALL, pkt);
-    _dispatch_rcv_pkt(GNRC_NETTYPE_IPV6, nh, pkt);
+            gnrc_ipv6_ext_demux(iface, current, pkt, nh);
+
+            return;
+#endif
+        case PROTNUM_IPV6:
+            DEBUG("ipv6: handle encapsulated IPv6 packet (nh = %u)\n", nh);
+            _decapsulate(pkt);
+            return;
+        default:
+            assert(false);
+            break;
+    }
+
+    assert(false);
 }
 
 /* internal functions */
+static void _dispatch_next_header(gnrc_pktsnip_t *current, gnrc_pktsnip_t *pkt,
+                                  uint8_t nh, bool interested)
+{
+#ifdef MODULE_GNRC_IPV6_EXT
+    const bool should_dispatch_current_type = ((current->type != GNRC_NETTYPE_IPV6_EXT) ||
+                                               (current->next->type == GNRC_NETTYPE_IPV6));
+#else
+    const bool should_dispatch_current_type = (current->next->type == GNRC_NETTYPE_IPV6);
+#endif
+
+    DEBUG("ipv6: forward nh = %u to other threads\n", nh);
+
+    /* dispatch IPv6 extension header only once */
+    if (should_dispatch_current_type) {
+        bool should_release = (gnrc_netreg_num(GNRC_NETTYPE_IPV6, nh) == 0) &&
+                              (!interested);
+
+        if (!should_release) {
+            gnrc_pktbuf_hold(pkt, 1);   /* don't remove from packet buffer in
+                                         * next dispatch */
+        }
+        if (gnrc_netapi_dispatch_receive(current->type,
+                                         GNRC_NETREG_DEMUX_CTX_ALL,
+                                         pkt) == 0) {
+            gnrc_pktbuf_release(pkt);
+        }
+
+        if (should_release) {
+            return;
+        }
+    }
+    if (interested) {
+        gnrc_pktbuf_hold(pkt, 1);   /* don't remove from packet buffer in
+                                     * next dispatch */
+    }
+    if (gnrc_netapi_dispatch_receive(GNRC_NETTYPE_IPV6, nh, pkt) == 0) {
+        gnrc_pktbuf_release(pkt);
+    }
+}
+
 static void *_event_loop(void *args)
 {
     msg_t msg, reply, msg_q[GNRC_IPV6_MSG_QUEUE_SIZE];
@@ -202,11 +284,13 @@ static void *_event_loop(void *args)
                 ((gnrc_ipv6_nc_t *)msg.content.ptr)->flags &= ~GNRC_IPV6_NC_IS_ROUTER;
                 break;
 
-            case GNRC_NDP_MSG_ADDR_TIMEOUT:
-                DEBUG("ipv6: Router advertisement timer event received\n");
-                gnrc_ipv6_netif_remove_addr(KERNEL_PID_UNDEF,
-                                            (ipv6_addr_t *)msg.content.ptr);
-                break;
+            /* XXX reactivate when https://github.com/RIOT-OS/RIOT/issues/5122 is
+             * solved properly */
+            /* case GNRC_NDP_MSG_ADDR_TIMEOUT: */
+            /*     DEBUG("ipv6: Router advertisement timer event received\n"); */
+            /*     gnrc_ipv6_netif_remove_addr(KERNEL_PID_UNDEF, */
+            /*                                 (ipv6_addr_t *)msg.content.ptr); */
+            /*     break; */
 
             case GNRC_NDP_MSG_NBR_SOL_RETRANS:
                 DEBUG("ipv6: Neigbor solicitation retransmission timer event received\n");
@@ -257,10 +341,12 @@ static void *_event_loop(void *args)
                 gnrc_sixlowpan_nd_router_abr_remove(
                         (gnrc_sixlowpan_nd_router_abr_t *)msg.content.ptr);
                 break;
-            case GNRC_SIXLOWPAN_ND_MSG_AR_TIMEOUT:
-                DEBUG("ipv6: address registration timeout received\n");
-                gnrc_sixlowpan_nd_router_gc_nc((gnrc_ipv6_nc_t *)msg.content.ptr);
-                break;
+            /* XXX reactivate when https://github.com/RIOT-OS/RIOT/issues/5122 is
+             * solved properly */
+            /* case GNRC_SIXLOWPAN_ND_MSG_AR_TIMEOUT: */
+            /*     DEBUG("ipv6: address registration timeout received\n"); */
+            /*     gnrc_sixlowpan_nd_router_gc_nc((gnrc_ipv6_nc_t *)msg.content.ptr); */
+            /*     break; */
             case GNRC_NDP_MSG_RTR_ADV_SIXLOWPAN_DELAY:
                 DEBUG("ipv6: Delayed router advertisement event received\n");
                 gnrc_ipv6_nc_t *nc_entry = (gnrc_ipv6_nc_t *)msg.content.ptr;
@@ -287,8 +373,13 @@ static void _send_to_iface(kernel_pid_t iface, gnrc_pktsnip_t *pkt)
         gnrc_pktbuf_release(pkt);
         return;
     }
+#ifdef MODULE_NETSTATS_IPV6
+    if_entry->stats.tx_success++;
+    if_entry->stats.tx_bytes += gnrc_pkt_len(pkt->next);
+#endif
+
 #ifdef MODULE_GNRC_SIXLOWPAN
-    if ((if_entry != NULL) && (if_entry->flags & GNRC_IPV6_NETIF_FLAGS_SIXLOWPAN)) {
+    if (if_entry->flags & GNRC_IPV6_NETIF_FLAGS_SIXLOWPAN) {
         DEBUG("ipv6: send to 6LoWPAN instead\n");
         if (!gnrc_netapi_dispatch_send(GNRC_NETTYPE_SIXLOWPAN, GNRC_NETREG_DEMUX_CTX_ALL, pkt)) {
             DEBUG("ipv6: no 6LoWPAN thread found");
@@ -333,6 +424,9 @@ static void _send_unicast(kernel_pid_t iface, uint8_t *dst_l2addr,
 
     DEBUG("ipv6: send unicast over interface %" PRIkernel_pid "\n", iface);
     /* and send to interface */
+#ifdef MODULE_NETSTATS_IPV6
+    gnrc_ipv6_netif_get_stats(iface)->tx_unicast_count++;
+#endif
     _send_to_iface(iface, pkt);
 }
 
@@ -343,8 +437,8 @@ static int _fill_ipv6_hdr(kernel_pid_t iface, gnrc_pktsnip_t *ipv6,
     ipv6_hdr_t *hdr = ipv6->data;
 
     hdr->len = byteorder_htons(gnrc_pkt_len(payload));
-    DEBUG("ipv6: set payload length to %zu (network byteorder %04" PRIx16 ")\n",
-          gnrc_pkt_len(payload), hdr->len.u16);
+    DEBUG("ipv6: set payload length to %u (network byteorder %04" PRIx16 ")\n",
+          (unsigned) gnrc_pkt_len(payload), hdr->len.u16);
 
     /* check if e.g. extension header was not already marked */
     if (hdr->nh == PROTNUM_RESERVED) {
@@ -356,7 +450,7 @@ static int _fill_ipv6_hdr(kernel_pid_t iface, gnrc_pktsnip_t *ipv6,
         }
     }
 
-    DEBUG("ipv6: set next header to %" PRIu8 "\n", hdr->nh);
+    DEBUG("ipv6: set next header to %u\n", hdr->nh);
 
     if (hdr->hl == 0) {
         if (iface == KERNEL_PID_UNDEF) {
@@ -372,7 +466,7 @@ static int _fill_ipv6_hdr(kernel_pid_t iface, gnrc_pktsnip_t *ipv6,
             ipv6_addr_set_loopback(&hdr->src);
         }
         else {
-            ipv6_addr_t *src = gnrc_ipv6_netif_find_best_src_addr(iface, &hdr->dst);
+            ipv6_addr_t *src = gnrc_ipv6_netif_find_best_src_addr(iface, &hdr->dst, false);
 
             if (src != NULL) {
                 DEBUG("ipv6: set packet source to %s\n",
@@ -400,6 +494,9 @@ static inline void _send_multicast_over_iface(kernel_pid_t iface, gnrc_pktsnip_t
     DEBUG("ipv6: send multicast over interface %" PRIkernel_pid "\n", iface);
     /* mark as multicast */
     ((gnrc_netif_hdr_t *)pkt->data)->flags |= GNRC_NETIF_HDR_FLAGS_MULTICAST;
+#ifdef MODULE_NETSTATS_IPV6
+    gnrc_ipv6_netif_get_stats(iface)->tx_mcast_count++;
+#endif
     /* and send to interface */
     _send_to_iface(iface, pkt);
 }
@@ -544,12 +641,7 @@ static inline kernel_pid_t _next_hop_l2addr(uint8_t *l2addr, uint8_t *l2addr_len
 #elif !defined(MODULE_GNRC_SIXLOWPAN_ND) && defined(MODULE_GNRC_IPV6_NC)
     (void)pkt;
     gnrc_ipv6_nc_t *nc = gnrc_ipv6_nc_get(iface, dst);
-    if ((nc == NULL) || !gnrc_ipv6_nc_is_reachable(nc)) {
-        return KERNEL_PID_UNDEF;
-    }
-    found_iface = nc->iface;
-    *l2addr_len = nc->l2_addr_len;
-    memcpy(l2addr, nc->l2_addr, nc->l2_addr_len);
+    found_iface = gnrc_ipv6_nc_get_l2_addr(l2addr, l2addr_len, nc);
 #elif !defined(MODULE_GNRC_SIXLOWPAN_ND)
     found_iface = KERNEL_PID_UNDEF;
     (void)l2addr;
@@ -681,50 +773,50 @@ static inline bool _pkt_not_for_me(kernel_pid_t *iface, ipv6_hdr_t *hdr)
     if (ipv6_addr_is_loopback(&hdr->dst)) {
         return false;
     }
-    else if (*iface == KERNEL_PID_UNDEF) {
-        *iface = gnrc_ipv6_netif_find_by_addr(NULL, &hdr->dst);
-        return (*iface == KERNEL_PID_UNDEF);
+    else if ((!ipv6_addr_is_link_local(&hdr->dst)) ||
+             (*iface == KERNEL_PID_UNDEF)) {
+        kernel_pid_t if_pid = gnrc_ipv6_netif_find_by_addr(NULL, &hdr->dst);
+        if (*iface == KERNEL_PID_UNDEF) {
+            *iface = if_pid;    /* Use original interface for reply if
+                                 * existent */
+        }
+        return (if_pid == KERNEL_PID_UNDEF);
     }
     else {
         return (gnrc_ipv6_netif_find_addr(*iface, &hdr->dst) == NULL);
     }
 }
 
-static void _dispatch_rcv_pkt(gnrc_nettype_t type, uint32_t demux_ctx,
-                              gnrc_pktsnip_t *pkt)
-{
-    gnrc_netreg_entry_t *entry = gnrc_netreg_lookup(type, demux_ctx);
-
-    while (entry) {
-        DEBUG("ipv6: Send receive command for %p to %" PRIu16 "\n", (void *)pkt,
-              entry->pid);
-        if (gnrc_netapi_receive(entry->pid, pkt) < 1) {
-            DEBUG("ipv6: unable to deliver packet\n");
-            gnrc_pktbuf_release(pkt);
-        }
-        entry = gnrc_netreg_getnext(entry);
-    }
-}
-
 static void _receive(gnrc_pktsnip_t *pkt)
 {
     kernel_pid_t iface = KERNEL_PID_UNDEF;
-    gnrc_pktsnip_t *ipv6, *netif;
+    gnrc_pktsnip_t *ipv6, *netif, *first_ext;
     ipv6_hdr_t *hdr;
 
     assert(pkt != NULL);
 
-    LL_SEARCH_SCALAR(pkt, netif, type, GNRC_NETTYPE_NETIF);
+    netif = gnrc_pktsnip_search_type(pkt, GNRC_NETTYPE_NETIF);
 
     if (netif != NULL) {
         iface = ((gnrc_netif_hdr_t *)netif->data)->if_pid;
+
+#ifdef MODULE_NETSTATS_IPV6
+        assert(iface);
+        netstats_t *stats = gnrc_ipv6_netif_get_stats(iface);
+        stats->rx_count++;
+        stats->rx_bytes += (gnrc_pkt_len(pkt) - netif->size);
+#endif
     }
+
+    first_ext = pkt;
 
     for (ipv6 = pkt; ipv6 != NULL; ipv6 = ipv6->next) { /* find IPv6 header if already marked */
         if ((ipv6->type == GNRC_NETTYPE_IPV6) && (ipv6->size == sizeof(ipv6_hdr_t)) &&
             (ipv6_hdr_is(ipv6->data))) {
             break;
         }
+
+        first_ext = ipv6;
     }
 
     if (ipv6 == NULL) {
@@ -736,6 +828,13 @@ static void _receive(gnrc_pktsnip_t *pkt)
 #ifdef MODULE_GNRC_IPV6_WHITELIST
         if (!gnrc_ipv6_whitelisted(&((ipv6_hdr_t *)(pkt->data))->src)) {
             DEBUG("ipv6: Source address not whitelisted, dropping packet\n");
+            gnrc_pktbuf_release(pkt);
+            return;
+        }
+#endif
+#ifdef MODULE_GNRC_IPV6_BLACKLIST
+        if (gnrc_ipv6_blacklisted(&((ipv6_hdr_t *)(pkt->data))->src)) {
+            DEBUG("ipv6: Source address blacklisted, dropping packet\n");
             gnrc_pktbuf_release(pkt);
             return;
         }
@@ -753,6 +852,8 @@ static void _receive(gnrc_pktsnip_t *pkt)
 
         ipv6 = gnrc_pktbuf_mark(pkt, sizeof(ipv6_hdr_t), GNRC_NETTYPE_IPV6);
 
+        first_ext = pkt;
+
         if (ipv6 == NULL) {
             DEBUG("ipv6: error marking IPv6 header, dropping packet\n");
             gnrc_pktbuf_release(pkt);
@@ -763,6 +864,14 @@ static void _receive(gnrc_pktsnip_t *pkt)
     else if (!gnrc_ipv6_whitelisted(&((ipv6_hdr_t *)(ipv6->data))->src)) {
         /* if ipv6 header already marked*/
         DEBUG("ipv6: Source address not whitelisted, dropping packet\n");
+        gnrc_pktbuf_release(pkt);
+        return;
+    }
+#endif
+#ifdef MODULE_GNRC_IPV6_BLACKLIST
+    else if (gnrc_ipv6_blacklisted(&((ipv6_hdr_t *)(ipv6->data))->src)) {
+        /* if ipv6 header already marked*/
+        DEBUG("ipv6: Source address blacklisted, dropping packet\n");
         gnrc_pktbuf_release(pkt);
         return;
     }
@@ -779,7 +888,7 @@ static void _receive(gnrc_pktsnip_t *pkt)
 
     DEBUG("ipv6: Received (src = %s, ",
           ipv6_addr_to_str(addr_str, &(hdr->src), sizeof(addr_str)));
-    DEBUG("dst = %s, next header = %" PRIu8 ", length = %" PRIu16 ")\n",
+    DEBUG("dst = %s, next header = %u, length = %" PRIu16 ")\n",
           ipv6_addr_to_str(addr_str, &(hdr->dst), sizeof(addr_str)),
           hdr->nh, byteorder_ntohs(hdr->len));
 
@@ -788,14 +897,14 @@ static void _receive(gnrc_pktsnip_t *pkt)
 
 #ifdef MODULE_GNRC_IPV6_ROUTER    /* only routers redirect */
         /* redirect to next hop */
-        DEBUG("ipv6: decrement hop limit to %" PRIu8 "\n", (uint8_t) (hdr->hl - 1));
+        DEBUG("ipv6: decrement hop limit to %u\n", (uint8_t) (hdr->hl - 1));
 
         /* RFC 4291, section 2.5.6 states: "Routers must not forward any
          * packets with Link-Local source or destination addresses to other
          * links."
          */
         if ((ipv6_addr_is_link_local(&(hdr->src))) || (ipv6_addr_is_link_local(&(hdr->dst)))) {
-            DEBUG("ipv6: do not forward packets with link-local source or"\
+            DEBUG("ipv6: do not forward packets with link-local source or"
                   " destination address\n");
             gnrc_pktbuf_release(pkt);
             return;
@@ -813,8 +922,15 @@ static void _receive(gnrc_pktsnip_t *pkt)
                 gnrc_pktbuf_release(pkt);
                 return;
             }
-            gnrc_pktbuf_remove_snip(pkt, ipv6->next);   /* remove L2 headers around IPV6 */
-            while (ptr != NULL) {                       /* reverse packet order */
+
+            /* remove L2 headers around IPV6 */
+            netif = gnrc_pktsnip_search_type(pkt, GNRC_NETTYPE_NETIF);
+            if (netif != NULL) {
+                gnrc_pktbuf_remove_snip(pkt, netif);
+            }
+
+            /* reverse packet snip list order */
+            while (ptr != NULL) {
                 gnrc_pktsnip_t *next;
                 ptr = gnrc_pktbuf_start_write(ptr);     /* duplicate if not already done */
                 if (ptr == NULL) {
@@ -846,7 +962,7 @@ static void _receive(gnrc_pktsnip_t *pkt)
     }
 
     /* IPv6 internal demuxing (ICMPv6, Extension headers etc.) */
-    gnrc_ipv6_demux(iface, pkt, hdr->nh);
+    gnrc_ipv6_demux(iface, first_ext, pkt, hdr->nh);
 }
 
 static void _decapsulate(gnrc_pktsnip_t *pkt)

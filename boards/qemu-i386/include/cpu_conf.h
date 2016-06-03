@@ -30,8 +30,7 @@ extern "C" {
 #define THREAD_EXTRA_STACKSIZE_PRINTF            (8192)
 #define THREAD_EXTRA_STACKSIZE_PRINTF_FLOAT      (8192)
 #define THREAD_STACKSIZE_MINIMUM                 (8192)
-
-#define F_CPU (1000000) /* This value is unused in x86 */
+#define ISR_STACKSIZE                            (0)
 
 #ifdef __cplusplus
 }

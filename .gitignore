@@ -38,19 +38,6 @@ _sketches.cpp
 # local override files
 Makefile.local
 
-# downloaded package sources
-pkg/ccn-lite/ccn-lite
-pkg/cmsis-dsp/cmsis-dsp
-pkg/libcoap/libcoap
-pkg/libfixmath/libfixmath
-pkg/microcoap/microcoap
-pkg/micro-ecc/micro-ecc
-pkg/oonf_api/oonf_api
-pkg/openwsn/openwsn
-pkg/relic/relic
-pkg/tlsf/tlsf
-pkg/wakaama/wakaama
-
 # Vagrant
 .vagrant
 
@@ -59,3 +46,4 @@ pkg/wakaama/wakaama
 # YouCompleteMe (https://github.com/Valloric/YouCompleteMe)
 .ycm_extra_conf.py
 .ycm_extra_conf.pyc
+__pycache__

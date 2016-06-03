@@ -41,7 +41,13 @@ endif
 ifneq (,$(filter gnrc_ipv6_whitelist,$(USEMODULE)))
   SRC += sc_whitelist.c
 endif
-ifneq (,$(filter gnrc_icmpv6_echo xtimer,$(USEMODULE)))
+ifneq (,$(filter gnrc_ipv6_blacklist,$(USEMODULE)))
+  SRC += sc_blacklist.c
+endif
+# The ping command in sc_icmpv6_echo requires xtimer, too. However, this is
+# implicitly pulled in by gnrc_ipv6_netif (which is a dependency of gnrc_ipv6)
+# already.
+ifneq (,$(filter gnrc_icmpv6_echo,$(USEMODULE)))
   SRC += sc_icmpv6_echo.c
 endif
 ifneq (,$(filter gnrc_zep,$(USEMODULE)))

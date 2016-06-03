@@ -35,7 +35,7 @@ RIOT is developed by an open community that anyone is welcome to join:
    RIOT (or to just stay in the loop). A searchable archive of this list is
    available at the
    [RIOT user Gmane newsgroup](http://news.gmane.org/gmane.os.riot.user)
- - [Subscribe]((http://lists.riot-os.org/mailman/listinfo/devel) to
+ - [Subscribe](http://lists.riot-os.org/mailman/listinfo/devel) to
    devel@riot-os.org to follow and discuss kernel and network stack
    developement, or hardware support. A searchable archive of this list is
    available at the
@@ -57,7 +57,8 @@ git clone git://github.com/RIOT-OS/RIOT.git # assumption: git is pre-installed
 git checkout <LATEST_RELEASE>
 cd RIOT
 ./dist/tools/tapsetup/tapsetup              # create virtual Ethernet
-                                            # interfaces to connect to RIOT
+                                            # interfaces to connect multiple
+                                            # RIOT instances
 cd examples/default/
 make all
 make term

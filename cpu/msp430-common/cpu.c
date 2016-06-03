@@ -1,5 +1,6 @@
 /*
- * Copyright (C) 2014, Freie Universitaet Berlin (FUB) & INRIA.
+ * Copyright (C) 2016 Kaspar Schleiser <kaspar@schleiser.de>
+ *               2014, Freie Universitaet Berlin (FUB) & INRIA.
  * All rights reserved.
  *
  * This file is subject to the terms and conditions of the GNU Lesser
@@ -9,8 +10,6 @@
 
 #include "cpu.h"
 #include "irq.h"
-#include "kernel.h"
-#include "kernel_internal.h"
 #include "sched.h"
 #include "thread.h"
 
@@ -32,6 +31,13 @@ __attribute__((naked)) void thread_yield_higher(void)
     __restore_context();
 
     UNREACHABLE();
+}
+
+/* This function calculates the ISR_usage */
+int thread_arch_isr_stack_usage(void)
+{
+    /* TODO */
+    return -1;
 }
 
 NORETURN void cpu_switch_context_exit(void)
@@ -93,15 +99,11 @@ char *thread_stack_init(thread_task_func_t task_func, void *arg, void *stack_sta
 /******************************************************************************/
 
 /* System reboot */
-int reboot_arch(int mode)
+void reboot(void)
 {
-    (void) mode;
-
     /* force an hardware reboot ("Power-Up Clear"), by writing
        an illegal value to the watchdog control register */
     while (1) {
         WDTCTL = 0x0000;
     }
-
-    return -1;
 }

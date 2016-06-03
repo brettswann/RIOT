@@ -31,23 +31,11 @@ extern "C" {
 #endif
 
 /**
- * Define the nominal CPU core clock in this board
- */
-#define F_CPU               (CLOCK_CORECLOCK)
-
-/**
- * Assign the hardware timer
+ * @brief   xtimer configuration
+ * @{
  */
 #define XTIMER              TIMER_1
 #define XTIMER_CHAN         (0)
-
-/**
- * @name Define UART device and baudrate for stdio
- * @{
- */
-#define STDIO               UART_DEV(0)
-#define STDIO_BAUDRATE      (115200U)
-#define STDIO_RX_BUFSIZE    (64U)
 /** @} */
 
 /**
@@ -63,32 +51,26 @@ extern "C" {
                                      .reset_pin = GPIO_PIN(PB, 15)}
 
 /**
- * @name LED pin definitions
+ * @brief   LED pin definitions and handlers
  * @{
  */
+#define LED0_PIN            GPIO_PIN(0, 19)
+
 #define LED_PORT            PORT->Group[0]
-#define LED_PIN             (19)
-#define LED_GPIO            GPIO_PIN(0, 19)
+#define LED0_MASK           (1 << 19)
+
+#define LED0_ON             (LED_PORT.OUTCLR.reg = LED0_MASK)
+#define LED0_OFF            (LED_PORT.OUTSET.reg = LED0_MASK)
+#define LED0_TOGGLE         (LED_PORT.OUTTGL.reg = LED0_MASK)
 /** @} */
 
 /**
- * @name Macros for controlling the on-board LEDs.
+ * @name SW0 (Button) pin definitions
  * @{
  */
-#define LED_ON              (LED_PORT.OUTCLR.reg = (1 << LED_PIN))
-#define LED_OFF             (LED_PORT.OUTSET.reg = (1 << LED_PIN))
-#define LED_TOGGLE          (LED_PORT.OUTTGL.reg = (1 << LED_PIN))
-
-/* for compatability to other boards */
-#define LED_GREEN_ON        /* not available */
-#define LED_GREEN_OFF       /* not available */
-#define LED_GREEN_TOGGLE    /* not available */
-#define LED_ORANGE_ON       /* not available */
-#define LED_ORANGE_OFF      /* not available */
-#define LED_ORANGE_TOGGLE   /* not available */
-#define LED_RED_ON          LED_ON
-#define LED_RED_OFF         LED_OFF
-#define LED_RED_TOGGLE      LED_TOGGLE
+#define BUTTON_PORT         PORT->Group[0]
+#define BUTTON_PIN          (28)
+#define BUTTON_GPIO         GPIO_PIN(0, BUTTON_PIN)
 /** @} */
 
 /**

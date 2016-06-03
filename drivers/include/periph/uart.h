@@ -44,7 +44,9 @@
 #ifndef PERIPH_UART_H
 #define PERIPH_UART_H
 
+#include <stddef.h>
 #include <stdint.h>
+#include <limits.h>
 
 #include "periph_cpu.h"
 #include "periph_conf.h"
@@ -78,7 +80,7 @@ typedef unsigned int uart_t;
  * @{
  */
 #ifndef UART_UNDEF
-#define UART_UNDEF          (-1)
+#define UART_UNDEF          (UINT_MAX)
 #endif
 /** @} */
 
@@ -97,7 +99,7 @@ typedef unsigned int uart_t;
  * @param[in] arg           context to the callback (optional)
  * @param[in] data          the byte that was received
  */
-typedef void(*uart_rx_cb_t)(void *arg, char data);
+typedef void(*uart_rx_cb_t)(void *arg, uint8_t data);
 
 /**
  * @brief   Interrupt context for a UART device

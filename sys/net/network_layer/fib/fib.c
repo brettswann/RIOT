@@ -132,8 +132,8 @@ static int fib_find_entry(fib_table_t *table, uint8_t *dst, size_t dst_size,
 
             int ret_comp = universal_address_compare(table->data.entries[i].global, dst, &match_size);
             /* If we found an exact match */
-            if (ret_comp == 0 || (is_all_zeros_addr && match_size == 0)) {
-                DEBUG("[fib_find_entry] found an exact match");
+            if ((ret_comp == UNIVERSAL_ADDRESS_EQUAL)
+                || (is_all_zeros_addr && (ret_comp == UNIVERSAL_ADDRESS_IS_ALL_ZERO_ADDRESS))) {
                 entry_arr[0] = &(table->data.entries[i]);
                 *entry_arr_size = 1;
                 /* we will not find a better one so we return */
@@ -141,14 +141,31 @@ static int fib_find_entry(fib_table_t *table, uint8_t *dst, size_t dst_size,
             }
             else {
                 /* we try to find the most fitting prefix */
-                if ((ret_comp == 1)
-                    && (table->data.entries[i].global_flags & FIB_FLAG_NET_PREFIX)) {
-                    if ((prefix_size == 0) || (match_size > prefix_size)) {
+                if (ret_comp == UNIVERSAL_ADDRESS_MATCHING_PREFIX) {
+                    if (table->data.entries[i].global_flags & FIB_FLAG_NET_PREFIX_MASK) {
+                        /* we shift the most upper flag byte back to get the number of prefix bits */
+                        size_t global_prefix_len = (table->data.entries[i].global_flags
+                                                    & FIB_FLAG_NET_PREFIX_MASK) >> FIB_FLAG_NET_PREFIX_SHIFT;
+
+                        if ((match_size >= global_prefix_len) &&
+                            ((prefix_size == 0) || (match_size > prefix_size))) {
+                            entry_arr[0] = &(table->data.entries[i]);
+                            /* we could find a better one so we move on */
+                            ret = 0;
+
+                            prefix_size = match_size;
+                            count = 1;
+                        }
+                    }
+                 }
+                 else if (ret_comp == UNIVERSAL_ADDRESS_IS_ALL_ZERO_ADDRESS) {
+                    /* we found the default gateway entry, e.g. ::/0 for IPv6
+                     * and we keep it only if there is no better one
+                     */
+                    if (prefix_size == 0) {
                         entry_arr[0] = &(table->data.entries[i]);
                         /* we could find a better one so we move on */
                         ret = 0;
-
-                        prefix_size = match_size;
                         count = 1;
                     }
                 }
@@ -328,13 +345,13 @@ static int fib_signal_rp(fib_table_t *table, uint16_t type, uint8_t *dat,
     for (size_t i = 0; i < FIB_MAX_REGISTERED_RP; ++i) {
         if (table->notify_rp[i] != KERNEL_PID_UNDEF) {
             DEBUG("[fib_signal_rp] send msg@: %p to pid[%d]: %d\n", \
-                  msg.content.ptr, (int)i, (int)(table->notify_rp[i]));
+                  (void *)msg.content.ptr, (int)i, (int)(table->notify_rp[i]));
 
             /* do only signal a RP if its registered prefix matches */
             if (type != FIB_MSG_RP_SIGNAL_SOURCE_ROUTE_CREATED) {
                 size_t dat_size_in_bits = dat_size<<3;
                 if (universal_address_compare(table->prefix_rp[i], dat,
-                                              &dat_size_in_bits) == 1) {
+                                              &dat_size_in_bits) != -ENOENT) {
                     /* the receiver, i.e. the RP, MUST copy the content value.
                      * using the provided pointer after replying this message
                      * will lead to errors
@@ -349,7 +366,7 @@ static int fib_signal_rp(fib_table_t *table, uint16_t type, uint8_t *dat,
                 size_t dat_size_in_bits = temp_sr->sr_dest->address->address_size << 3;
                 if (universal_address_compare(table->prefix_rp[i],
                                               temp_sr->sr_dest->address->address,
-                                              &dat_size_in_bits) == 1) {
+                                              &dat_size_in_bits) != -ENOENT) {
                     /* the receiver, i.e. the RP, MUST copy the content value.
                      * using the provided pointer after replying this message
                      * will lead to errors
@@ -451,6 +468,21 @@ void fib_remove_entry(fib_table_t *table, uint8_t *dst, size_t dst_size)
     mutex_unlock(&(table->mtx_access));
 }
 
+void fib_flush(fib_table_t *table, kernel_pid_t interface)
+{
+    mutex_lock(&(table->mtx_access));
+    DEBUG("[fib_flush]\n");
+
+    for (size_t i = 0; i < table->size; ++i) {
+        if ((interface == KERNEL_PID_UNDEF) ||
+            (interface == table->data.entries[i].iface_id)) {
+            fib_remove(&table->data.entries[i]);
+        }
+    }
+
+    mutex_unlock(&(table->mtx_access));
+}
+
 int fib_get_next_hop(fib_table_t *table, kernel_pid_t *iface_id,
                      uint8_t *next_hop, size_t *next_hop_size,
                      uint32_t *next_hop_flags, uint8_t *dst, size_t dst_size,
@@ -516,7 +548,7 @@ int fib_get_destination_set(fib_table_t *table, uint8_t *prefix,
 
     for (size_t i = 0; i < table->size; ++i) {
         if ((table->data.entries[i].global != NULL) &&
-            (universal_address_compare_prefix(table->data.entries[i].global, prefix, prefix_size<<3) >= 0)) {
+            (universal_address_compare_prefix(table->data.entries[i].global, prefix, prefix_size<<3) >= UNIVERSAL_ADDRESS_EQUAL)) {
             if( (dst_set != NULL) && (found_entries < *dst_set_size) ) {
             /* set the size to full byte usage */
             dst_set[found_entries].dest_size = sizeof(dst_set[found_entries].dest);
@@ -669,9 +701,9 @@ int fib_sr_create(fib_table_t *table, fib_sr_t **fib_sr, kernel_pid_t sr_iface_i
 * @brief Internal function:
 *        checks the lifetime and removes the entry in case it expired
 */
-static int fib_sr_check_lifetime(fib_sr_t *fib_sr, uint64_t *now)
+static int fib_sr_check_lifetime(fib_sr_t *fib_sr)
 {
-    uint64_t tm = fib_sr->sr_lifetime - *now;
+    uint64_t tm = fib_sr->sr_lifetime - xtimer_now64();
     /* check if the lifetime expired */
     if ((int64_t)tm < 0) {
         /* remove this sr if its lifetime expired */
@@ -731,8 +763,6 @@ static int fib_is_sr_in_table(fib_table_t *table, fib_sr_t *fib_sr)
 int fib_sr_read_head(fib_table_t *table, fib_sr_t *fib_sr, kernel_pid_t *iface_id,
                      uint32_t *sr_flags, uint32_t *sr_lifetime)
 {
-    uint64_t now = xtimer_now64();
-
     mutex_lock(&(table->mtx_access));
     if ((fib_sr == NULL) || (iface_id == NULL) || (sr_flags == NULL)
         || (sr_lifetime == NULL) || (fib_is_sr_in_table(table, fib_sr) == -ENOENT) ) {
@@ -740,14 +770,14 @@ int fib_sr_read_head(fib_table_t *table, fib_sr_t *fib_sr, kernel_pid_t *iface_i
         return -EFAULT;
     }
 
-    if (fib_sr_check_lifetime(fib_sr, &now) == -ENOENT) {
+    if (fib_sr_check_lifetime(fib_sr) == -ENOENT) {
         mutex_unlock(&(table->mtx_access));
         return -ENOENT;
     }
 
     *iface_id = fib_sr->sr_iface_id;
     *sr_flags = fib_sr->sr_flags;
-    *sr_lifetime = fib_sr->sr_lifetime - now;
+    *sr_lifetime = fib_sr->sr_lifetime - xtimer_now64();
 
     mutex_unlock(&(table->mtx_access));
     return 0;
@@ -756,8 +786,6 @@ int fib_sr_read_head(fib_table_t *table, fib_sr_t *fib_sr, kernel_pid_t *iface_i
 int fib_sr_read_destination(fib_table_t *table, fib_sr_t *fib_sr,
                             uint8_t *dst, size_t *dst_size)
 {
-    uint64_t now = xtimer_now64();
-
     mutex_lock(&(table->mtx_access));
     if ((fib_sr == NULL) || (dst == NULL) || (dst_size == NULL)
         || (fib_is_sr_in_table(table, fib_sr) == -ENOENT)) {
@@ -765,7 +793,7 @@ int fib_sr_read_destination(fib_table_t *table, fib_sr_t *fib_sr,
         return -EFAULT;
     }
 
-    if (fib_sr_check_lifetime(fib_sr, &now) == -ENOENT) {
+    if (fib_sr_check_lifetime(fib_sr) == -ENOENT) {
         mutex_unlock(&(table->mtx_access));
         return -ENOENT;
     }
@@ -787,15 +815,13 @@ int fib_sr_read_destination(fib_table_t *table, fib_sr_t *fib_sr,
 int fib_sr_set(fib_table_t *table, fib_sr_t *fib_sr, kernel_pid_t *sr_iface_id,
                uint32_t *sr_flags, uint32_t *sr_lifetime)
 {
-    uint64_t now = xtimer_now64();
-
     mutex_lock(&(table->mtx_access));
     if ((fib_sr == NULL) || (fib_is_sr_in_table(table, fib_sr) == -ENOENT)) {
         mutex_unlock(&(table->mtx_access));
         return -EFAULT;
     }
 
-    if (fib_sr_check_lifetime(fib_sr, &now) == -ENOENT) {
+    if (fib_sr_check_lifetime(fib_sr) == -ENOENT) {
         mutex_unlock(&(table->mtx_access));
         return -ENOENT;
     }
@@ -842,8 +868,6 @@ int fib_sr_delete(fib_table_t *table, fib_sr_t *fib_sr)
 
 int fib_sr_next(fib_table_t *table, fib_sr_t *fib_sr, fib_sr_entry_t **sr_path_entry)
 {
-    uint64_t now = xtimer_now64();
-
     mutex_lock(&(table->mtx_access));
     if ((fib_sr == NULL) || (sr_path_entry == NULL)
         || (fib_is_sr_in_table(table, fib_sr) == -ENOENT)) {
@@ -856,7 +880,7 @@ int fib_sr_next(fib_table_t *table, fib_sr_t *fib_sr, fib_sr_entry_t **sr_path_e
         return -EFAULT;
     }
 
-    if (fib_sr_check_lifetime(fib_sr, &now) == -ENOENT) {
+    if (fib_sr_check_lifetime(fib_sr) == -ENOENT) {
         mutex_unlock(&(table->mtx_access));
         return -ENOENT;
     }
@@ -883,8 +907,6 @@ int fib_sr_next(fib_table_t *table, fib_sr_t *fib_sr, fib_sr_entry_t **sr_path_e
 int fib_sr_search(fib_table_t *table, fib_sr_t *fib_sr, uint8_t *addr, size_t addr_size,
                   fib_sr_entry_t **sr_path_entry)
 {
-    uint64_t now = xtimer_now64();
-
     mutex_lock(&(table->mtx_access));
     if ((fib_sr == NULL) || (addr == NULL) || (sr_path_entry == NULL)
         || (fib_is_sr_in_table(table, fib_sr) == -ENOENT)) {
@@ -892,7 +914,7 @@ int fib_sr_search(fib_table_t *table, fib_sr_t *fib_sr, uint8_t *addr, size_t ad
         return -EFAULT;
     }
 
-    if (fib_sr_check_lifetime(fib_sr, &now) == -ENOENT) {
+    if (fib_sr_check_lifetime(fib_sr) == -ENOENT) {
         mutex_unlock(&(table->mtx_access));
         return -ENOENT;
     }
@@ -900,7 +922,7 @@ int fib_sr_search(fib_table_t *table, fib_sr_t *fib_sr, uint8_t *addr, size_t ad
     fib_sr_entry_t *elt;
     LL_FOREACH(fib_sr->sr_path, elt) {
         size_t addr_size_match = addr_size << 3;
-        if (universal_address_compare(elt->address, addr, &addr_size_match) == 0) {
+        if (universal_address_compare(elt->address, addr, &addr_size_match) == UNIVERSAL_ADDRESS_EQUAL) {
 
             /* temporary workaround to calm compiler */
             (void)sr_path_entry;
@@ -918,8 +940,6 @@ int fib_sr_search(fib_table_t *table, fib_sr_t *fib_sr, uint8_t *addr, size_t ad
 int fib_sr_entry_append(fib_table_t *table, fib_sr_t *fib_sr,
                         uint8_t *addr, size_t addr_size)
 {
-    uint64_t now = xtimer_now64();
-
     mutex_lock(&(table->mtx_access));
     if ((fib_sr == NULL) || (addr == NULL)
         || (fib_is_sr_in_table(table, fib_sr) == -ENOENT)) {
@@ -927,7 +947,7 @@ int fib_sr_entry_append(fib_table_t *table, fib_sr_t *fib_sr,
         return -EFAULT;
     }
 
-    if (fib_sr_check_lifetime(fib_sr, &now) == -ENOENT) {
+    if (fib_sr_check_lifetime(fib_sr) == -ENOENT) {
         mutex_unlock(&(table->mtx_access));
         return -ENOENT;
     }
@@ -935,7 +955,7 @@ int fib_sr_entry_append(fib_table_t *table, fib_sr_t *fib_sr,
     fib_sr_entry_t *elt;
     LL_FOREACH(fib_sr->sr_path, elt) {
         size_t addr_size_match = addr_size << 3;
-        if (universal_address_compare(elt->address, addr, &addr_size_match) == 0) {
+        if (universal_address_compare(elt->address, addr, &addr_size_match) == UNIVERSAL_ADDRESS_EQUAL) {
             mutex_unlock(&(table->mtx_access));
             return -EINVAL;
         }
@@ -965,8 +985,6 @@ int fib_sr_entry_add(fib_table_t *table, fib_sr_t *fib_sr,
                      fib_sr_entry_t *sr_path_entry, uint8_t *addr, size_t addr_size,
                      bool keep_remaining_route)
 {
-    uint64_t now = xtimer_now64();
-
     mutex_lock(&(table->mtx_access));
     if ((fib_sr == NULL) || (sr_path_entry == NULL) || (addr == NULL)
         || (fib_is_sr_in_table(table, fib_sr) == -ENOENT)) {
@@ -974,7 +992,7 @@ int fib_sr_entry_add(fib_table_t *table, fib_sr_t *fib_sr,
         return -EFAULT;
     }
 
-    if (fib_sr_check_lifetime(fib_sr, &now) == -ENOENT) {
+    if (fib_sr_check_lifetime(fib_sr) == -ENOENT) {
         mutex_unlock(&(table->mtx_access));
         return -ENOENT;
     }
@@ -983,7 +1001,7 @@ int fib_sr_entry_add(fib_table_t *table, fib_sr_t *fib_sr,
     fib_sr_entry_t *elt;
     LL_FOREACH(fib_sr->sr_path, elt) {
         size_t addr_size_match = addr_size << 3;
-        if (universal_address_compare(elt->address, addr, &addr_size_match) == 0) {
+        if (universal_address_compare(elt->address, addr, &addr_size_match) == UNIVERSAL_ADDRESS_EQUAL) {
             mutex_unlock(&(table->mtx_access));
             return -EINVAL;
         }
@@ -1023,15 +1041,13 @@ int fib_sr_entry_add(fib_table_t *table, fib_sr_t *fib_sr,
 int fib_sr_entry_delete(fib_table_t *table, fib_sr_t *fib_sr, uint8_t *addr, size_t addr_size,
                         bool keep_remaining_route)
 {
-    uint64_t now = xtimer_now64();
-
     mutex_lock(&(table->mtx_access));
     if ((fib_sr == NULL) || (fib_is_sr_in_table(table, fib_sr) == -ENOENT)) {
         mutex_unlock(&(table->mtx_access));
         return -EFAULT;
     }
 
-    if (fib_sr_check_lifetime(fib_sr, &now) == -ENOENT) {
+    if (fib_sr_check_lifetime(fib_sr) == -ENOENT) {
         mutex_unlock(&(table->mtx_access));
         return -ENOENT;
     }
@@ -1041,7 +1057,7 @@ int fib_sr_entry_delete(fib_table_t *table, fib_sr_t *fib_sr, uint8_t *addr, siz
     LL_FOREACH(fib_sr->sr_path, elt) {
         size_t addr_size_match = addr_size << 3;
 
-        if (universal_address_compare(elt->address, addr, &addr_size_match) == 0) {
+        if (universal_address_compare(elt->address, addr, &addr_size_match) == UNIVERSAL_ADDRESS_EQUAL) {
             universal_address_rem(elt->address);
             if (keep_remaining_route) {
                 tmp->next = elt->next;
@@ -1075,8 +1091,6 @@ int fib_sr_entry_overwrite(fib_table_t *table, fib_sr_t *fib_sr,
                            uint8_t *addr_old, size_t addr_old_size,
                            uint8_t *addr_new, size_t addr_new_size)
 {
-    uint64_t now = xtimer_now64();
-
     mutex_lock(&(table->mtx_access));
     if ((fib_sr == NULL) || (addr_old == NULL) || (addr_new == NULL)
         || (fib_is_sr_in_table(table, fib_sr) == -ENOENT)) {
@@ -1084,7 +1098,7 @@ int fib_sr_entry_overwrite(fib_table_t *table, fib_sr_t *fib_sr,
         return -EFAULT;
     }
 
-    if (fib_sr_check_lifetime(fib_sr, &now) == -ENOENT) {
+    if (fib_sr_check_lifetime(fib_sr) == -ENOENT) {
         mutex_unlock(&(table->mtx_access));
         return -ENOENT;
     }
@@ -1094,11 +1108,11 @@ int fib_sr_entry_overwrite(fib_table_t *table, fib_sr_t *fib_sr,
     LL_FOREACH(fib_sr->sr_path, elt) {
         size_t addr_old_size_match = addr_old_size << 3;
         size_t addr_new_size_match = addr_old_size << 3;
-        if (universal_address_compare(elt->address, addr_old, &addr_old_size_match) == 0) {
+        if (universal_address_compare(elt->address, addr_old, &addr_old_size_match) == UNIVERSAL_ADDRESS_EQUAL) {
             elt_repl = elt;
         }
 
-        if (universal_address_compare(elt->address, addr_new, &addr_new_size_match) == 0) {
+        if (universal_address_compare(elt->address, addr_new, &addr_new_size_match) == UNIVERSAL_ADDRESS_EQUAL) {
             mutex_unlock(&(table->mtx_access));
             return -EINVAL;
         }
@@ -1127,15 +1141,13 @@ int fib_sr_entry_overwrite(fib_table_t *table, fib_sr_t *fib_sr,
 int fib_sr_entry_get_address(fib_table_t *table, fib_sr_t *fib_sr, fib_sr_entry_t *sr_entry,
                              uint8_t *addr, size_t *addr_size)
 {
-    uint64_t now = xtimer_now64();
-
     mutex_lock(&(table->mtx_access));
     if ((fib_sr == NULL) || (fib_is_sr_in_table(table, fib_sr) == -ENOENT)) {
         mutex_unlock(&(table->mtx_access));
         return -EFAULT;
     }
 
-    if (fib_sr_check_lifetime(fib_sr, &now) == -ENOENT) {
+    if (fib_sr_check_lifetime(fib_sr) == -ENOENT) {
         mutex_unlock(&(table->mtx_access));
         return -ENOENT;
     }
@@ -1180,7 +1192,7 @@ fib_sr_t* hit = NULL;
             fib_sr_entry_t *elt;
             LL_FOREACH(table->data.source_routes->headers[i].sr_path, elt) {
                 size_t addr_size_match = dst_size << 3;
-                if (universal_address_compare(elt->address, dst, &addr_size_match) == 0) {
+                if (universal_address_compare(elt->address, dst, &addr_size_match) == UNIVERSAL_ADDRESS_EQUAL) {
                     /* we create a new sr */
                     if (check_free_entry == -1) {
                         /* we have no room to create a new sr
@@ -1274,8 +1286,6 @@ int fib_sr_get_route(fib_table_t *table, uint8_t *dst, size_t dst_size, kernel_p
                      uint8_t *addr_list, size_t *addr_list_elements, size_t *element_size,
                      bool reverse, fib_sr_t **fib_sr)
 {
-    uint64_t now = xtimer_now64();
-
     mutex_lock(&(table->mtx_access));
 
     if ((dst == NULL) || (sr_iface_id == NULL) || (sr_flags == NULL)
@@ -1292,7 +1302,7 @@ int fib_sr_get_route(fib_table_t *table, uint8_t *dst, size_t dst_size, kernel_p
     /* Case 1 - check if we know a direct route */
     for (size_t i = 0; i < table->size; ++i) {
 
-        if (fib_sr_check_lifetime(&table->data.source_routes->headers[i], &now) == -ENOENT) {
+        if (fib_sr_check_lifetime(&table->data.source_routes->headers[i]) == -ENOENT) {
             /* expired, so skip this sr and remember its position */
             if (check_free_entry == -1) {
                 /* we want to fill up the source routes from the beginning */
@@ -1311,7 +1321,7 @@ int fib_sr_get_route(fib_table_t *table, uint8_t *dst, size_t dst_size, kernel_p
 
         size_t addr_size_match = dst_size << 3;
         if (universal_address_compare(table->data.source_routes->headers[i].sr_dest->address,
-                                      dst, &addr_size_match) == 0) {
+                                      dst, &addr_size_match) == UNIVERSAL_ADDRESS_EQUAL) {
             if (*sr_flags == table->data.source_routes->headers[i].sr_flags) {
                 /* found a perfect matching sr, no need to search further */
                 hit = &table->data.source_routes->headers[i];
@@ -1523,17 +1533,19 @@ void fib_print_routes(fib_table_t *table)
     uint64_t now = xtimer_now64();
 
     if (table->table_type == FIB_TABLE_TYPE_SH) {
-        printf("%-" FIB_ADDR_PRINT_LENS "s %-10s   %-" FIB_ADDR_PRINT_LENS "s %-10s %-16s"
+        printf("%-" FIB_ADDR_PRINT_LENS "s %-17s %-" FIB_ADDR_PRINT_LENS "s %-10s %-16s"
                 " Interface\n" , "Destination", "Flags", "Next Hop", "Flags", "Expires");
 
         for (size_t i = 0; i < table->size; ++i) {
             if (table->data.entries[i].lifetime != 0) {
                 fib_print_address(table->data.entries[i].global);
                 printf(" 0x%08"PRIx32" ", table->data.entries[i].global_flags);
-                if(table->data.entries[i].global_flags & FIB_FLAG_NET_PREFIX) {
-                    printf("N ");
+                if(table->data.entries[i].global_flags & FIB_FLAG_NET_PREFIX_MASK) {
+                    uint32_t prefix = (table->data.entries[i].global_flags
+                                       & FIB_FLAG_NET_PREFIX_MASK);
+                    printf("N /%-3d ", (int)(prefix >> FIB_FLAG_NET_PREFIX_SHIFT));
                 } else {
-                    printf("H ");
+                    printf("H      ");
                 }
 
                 fib_print_address(table->data.entries[i].next_hop);
@@ -1613,7 +1625,7 @@ int fib_devel_get_lifetime(fib_table_t *table, uint64_t *lifetime, uint8_t *dst,
         /* first hit wins here */
         for (size_t i = 0; i < table->size; ++i) {
             if (universal_address_compare(table->data.source_routes->headers[i].sr_dest->address,
-                                        dst, &addr_size_match) == 0) {
+                                        dst, &addr_size_match) == UNIVERSAL_ADDRESS_EQUAL) {
                 *lifetime = table->data.source_routes->headers[i].sr_lifetime;
                 return 0;
             }

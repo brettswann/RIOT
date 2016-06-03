@@ -15,6 +15,7 @@
  *
  * @author      Hauke Petersen <hauke.petersen@fu-berlin.de>
  * @author      Martine Lenders <mlenders@inf.fu-berlin.de>
+ * @author      Oliver Hahm <oliver.hahm@inria.fr>
  */
 
 #include <stdbool.h>
@@ -25,6 +26,7 @@
 #include <inttypes.h>
 
 #include "thread.h"
+#include "net/netstats.h"
 #include "net/ipv6/addr.h"
 #include "net/gnrc/ipv6/netif.h"
 #include "net/gnrc/netif.h"
@@ -71,6 +73,64 @@ static bool _is_iface(kernel_pid_t dev)
     return false;
 }
 
+#if defined(MODULE_NETSTATS)
+const char *_netstats_module_to_str(uint8_t module)
+{
+    switch (module) {
+        case NETSTATS_LAYER2:
+            return "Layer 2";
+        case NETSTATS_IPV6:
+            return "IPv6";
+        case NETSTATS_ALL:
+            return "all";
+        default:
+            return "Unknown";
+    }
+}
+
+static int _netif_stats(kernel_pid_t dev, unsigned module, bool reset)
+{
+    netstats_t *stats;
+    int res = -ENOTSUP;
+
+    if (module == NETSTATS_LAYER2) {
+        res = gnrc_netapi_get(dev, NETOPT_STATS, 0, &stats, sizeof(&stats));
+    }
+#ifdef MODULE_NETSTATS_IPV6
+    else if (module == NETSTATS_IPV6) {
+        stats = gnrc_ipv6_netif_get_stats(dev);
+        if (stats != NULL) {
+            res = 1;
+        }
+    }
+#endif
+
+    if (res < 0) {
+        puts("           Protocol or device doesn't provide statistics.");
+    }
+    else if (reset) {
+        memset(stats, 0, sizeof(netstats_t));
+        printf("Reset statistics for module %s!\n", _netstats_module_to_str(module));
+    }
+    else {
+        printf("           Statistics for %s\n"
+               "            RX packets %u  bytes %u\n"
+               "            TX packets %u (Multicast: %u)  bytes %u\n"
+               "            TX succeeded %u errors %u\n",
+               _netstats_module_to_str(module),
+               (unsigned) stats->rx_count,
+               (unsigned) stats->rx_bytes,
+               (unsigned) (stats->tx_unicast_count + stats->tx_mcast_count),
+               (unsigned) stats->tx_mcast_count,
+               (unsigned) stats->tx_bytes,
+               (unsigned) stats->tx_success,
+               (unsigned) stats->tx_failed);
+        res = 0;
+    }
+    return res;
+}
+#endif
+
 static void _set_usage(char *cmd_name)
 {
     printf("usage: %s <if_id> set <key> <value>\n", cmd_name);
@@ -88,8 +148,11 @@ static void _set_usage(char *cmd_name)
          "       * \"pan\" - alias for \"nid\"\n"
          "       * \"pan_id\" - alias for \"nid\"\n"
          "       * \"power\" - TX power in dBm\n"
+         "       * \"retrans\" - max. number of retransmissions\n"
          "       * \"src_len\" - sets the source address length in byte\n"
-         "       * \"state\" - set the device state\n");
+         "       * \"state\" - set the device state\n"
+         "       * \"encrypt\" - set the encryption on-off\n"
+         "       * \"key\" - set the encryption key in hexadecimal format\n");
 }
 
 static void _mtu_usage(char *cmd_name)
@@ -117,6 +180,12 @@ static void _del_usage(char *cmd_name)
 {
     printf("usage: %s <if_id> del <ipv6_addr>\n",
            cmd_name);
+}
+
+static void _stats_usage(char *cmd_name)
+{
+    printf("usage: %s <if_id> stats [l2|ipv6] [reset]\n", cmd_name);
+    puts("       reset can be only used if the module is specified.");
 }
 
 static void _print_netopt(netopt_t opt)
@@ -150,12 +219,24 @@ static void _print_netopt(netopt_t opt)
             printf("TX power [in dBm]");
             break;
 
+        case NETOPT_RETRANS:
+            printf("max. retransmissions");
+            break;
+
         case NETOPT_CSMA_RETRIES:
             printf("CSMA retries");
             break;
 
         case NETOPT_CCA_THRESHOLD:
             printf("CCA threshold [in dBm]");
+            break;
+
+        case NETOPT_ENCRYPTION:
+            printf("encryption");
+            break;
+
+        case NETOPT_ENCRYPTION_KEY:
+            printf("encryption key");
             break;
 
         default:
@@ -199,7 +280,7 @@ static void _netif_list(kernel_pid_t dev)
     uint8_t u8;
     int res;
     netopt_state_t state;
-    netopt_enable_t enable;
+    netopt_enable_t enable = NETOPT_DISABLE;
     bool linebreak = false;
 
 #ifdef MODULE_GNRC_IPV6_NETIF
@@ -235,29 +316,7 @@ static void _netif_list(kernel_pid_t dev)
     res = gnrc_netapi_get(dev, NETOPT_NID, 0, &u16, sizeof(u16));
 
     if (res >= 0) {
-        printf(" NID: 0x%" PRIx16 " ", u16);
-    }
-
-    res = gnrc_netapi_get(dev, NETOPT_TX_POWER, 0, &i16, sizeof(i16));
-
-    if (res >= 0) {
-        printf(" TX-Power: %" PRIi16 "dBm ", i16);
-    }
-
-    res = gnrc_netapi_get(dev, NETOPT_STATE, 0, &state, sizeof(state));
-
-    if (res >= 0) {
-        printf(" State: ");
-        _print_netopt_state(state);
-    }
-
-    res = gnrc_netapi_get(dev, NETOPT_CSMA_RETRIES, 0, &u8, sizeof(u8));
-
-    if (res >= 0) {
-        res = gnrc_netapi_get(dev, NETOPT_CSMA, 0, &enable, sizeof(enable));
-        if ((res >= 0) && (enable == NETOPT_ENABLE)) {
-            printf(" CSMA Retries: %u ", (unsigned)u8);
-        }
+        printf(" NID: 0x%" PRIx16, u16);
     }
 
     printf("\n           ");
@@ -273,8 +332,39 @@ static void _netif_list(kernel_pid_t dev)
     }
 
     if (linebreak) {
-        printf("\n           ");
+        printf("\n          ");
     }
+
+    res = gnrc_netapi_get(dev, NETOPT_TX_POWER, 0, &i16, sizeof(i16));
+
+    if (res >= 0) {
+        printf(" TX-Power: %" PRIi16 "dBm ", i16);
+    }
+
+    res = gnrc_netapi_get(dev, NETOPT_STATE, 0, &state, sizeof(state));
+
+    if (res >= 0) {
+        printf(" State: ");
+        _print_netopt_state(state);
+        printf(" ");
+    }
+
+    res = gnrc_netapi_get(dev, NETOPT_RETRANS, 0, &u8, sizeof(u8));
+
+    if (res >= 0) {
+        printf(" max. Retrans.: %u ", (unsigned)u8);
+    }
+
+    res = gnrc_netapi_get(dev, NETOPT_CSMA_RETRIES, 0, &u8, sizeof(u8));
+
+    if (res >= 0) {
+        res = gnrc_netapi_get(dev, NETOPT_CSMA, 0, &enable, sizeof(enable));
+        if ((res >= 0) && (enable == NETOPT_ENABLE)) {
+            printf(" CSMA Retries: %u ", (unsigned)u8);
+        }
+    }
+
+    printf("\n           ");
 
     res = gnrc_netapi_get(dev, NETOPT_PROMISCUOUSMODE, 0, &enable, sizeof(enable));
 
@@ -398,6 +488,13 @@ static void _netif_list(kernel_pid_t dev)
     }
 #endif
 
+#ifdef MODULE_NETSTATS_L2
+    puts("");
+    _netif_stats(dev, NETSTATS_LAYER2, false);
+#endif
+#ifdef MODULE_NETSTATS_IPV6
+    _netif_stats(dev, NETSTATS_IPV6, false);
+#endif
     puts("");
 }
 
@@ -560,6 +657,109 @@ static int _netif_set_state(kernel_pid_t dev, char *state_str)
     return 0;
 }
 
+static int _netif_set_encrypt(kernel_pid_t dev, netopt_t opt, char *encrypt_str)
+{
+    netopt_enable_t set;
+    size_t size = 1;
+    if ((strcmp("on", encrypt_str) == 0) || (strcmp("ON", encrypt_str) == 0)) {
+        set = NETOPT_ENABLE;
+    }
+    else if ((strcmp("off", encrypt_str) == 0) || (strcmp("OFF", encrypt_str) == 0)) {
+        set = NETOPT_DISABLE;
+    }
+    else {
+        puts("usage: ifconfig <if_id> set encryption [on|off]");
+        return 1;
+    }
+
+    if (gnrc_netapi_set(dev, opt, 0, &set, size) < 0) {
+        printf("error: unable to set ");
+        _print_netopt(opt);
+        puts("");
+        return 1;
+    }
+
+    printf("success: set ");
+    _print_netopt(opt);
+    printf(" on interface %" PRIkernel_pid " to %s\n", dev, encrypt_str);
+
+    return 0;
+}
+
+static int _hex_to_int(char c) {
+    if ('0' <= c && c <= '9') {
+        return c - '0';
+    }
+    else if ('a' <= c && c <= 'f') {
+        return c - 'a';
+    }
+    else if ('A' <= c && c <= 'F') {
+        return c - 'A';
+    }
+    else {
+        return -1;
+    }
+}
+
+static int _netif_set_encrypt_key(kernel_pid_t dev, netopt_t opt, char *key_str)
+{
+    size_t str_len = strlen(key_str);
+    size_t key_len = str_len / 2;
+    uint8_t key[key_len];
+
+    if (str_len == 14U) {
+        printf("\nNotice: setting 56 bit key.");
+    }
+    else if (str_len == 16U) {
+        printf("\nNotice: setting 64 bit key.");
+    }
+    else if (str_len == 32U) {
+        printf("\nNotice: setting 128 bit key.");
+    }
+    else if (str_len == 48U) {
+        printf("\nNotice: setting 192 bit key.");
+    }
+    else if (str_len == 64U) {
+        printf("\nNotice: setting 256 bit key.");
+    }
+    else if (str_len == 128U) {
+        printf("\nNotice: setting 512 bit key.");
+    }
+    else {
+        printf("error: invalid key size.\n");
+        return 1;
+    }
+    /* Convert any char from ASCII table in hex format */
+    for (size_t i = 0; i < str_len; i += 2) {
+        int i1 = _hex_to_int(key_str[i]);
+        int i2 = _hex_to_int(key_str[i + 1]);
+
+        if (i1 == -1 || i2 == -1) {
+            puts("error: unable to parse key");
+            return 1;
+        }
+
+        key[i / 2] = (uint8_t)((i1 << 4) + i2);
+    }
+
+    if (gnrc_netapi_set(dev, opt, 0, key, key_len) < 0) {
+        printf("error: unable to set ");
+        _print_netopt(opt);
+        puts("");
+        return 1;
+    }
+
+    printf("success: set ");
+    _print_netopt(opt);
+    printf(" on interface %" PRIkernel_pid " to \n", dev);
+    for (size_t i = 0; i < key_len; i++) {
+        /* print the hex value of the key */
+        printf("%02x", key[i]);
+    }
+    puts("");
+    return 0;
+}
+
 static int _netif_set(char *cmd_name, kernel_pid_t dev, char *key, char *value)
 {
     if ((strcmp("addr", key) == 0) || (strcmp("addr_short", key) == 0)) {
@@ -587,11 +787,20 @@ static int _netif_set(char *cmd_name, kernel_pid_t dev, char *key, char *value)
     else if (strcmp("state", key) == 0) {
         return _netif_set_state(dev, value);
     }
+    else if (strcmp("retrans", key) == 0) {
+        return _netif_set_u8(dev, NETOPT_RETRANS, value);
+    }
     else if (strcmp("csma_retries", key) == 0) {
         return _netif_set_u8(dev, NETOPT_CSMA_RETRIES, value);
     }
     else if (strcmp("cca_threshold", key) == 0) {
         return _netif_set_u8(dev, NETOPT_CCA_THRESHOLD, value);
+    }
+    else if (strcmp("encrypt", key) == 0) {
+        return _netif_set_encrypt(dev, NETOPT_ENCRYPTION, value);
+    }
+    else if (strcmp("key", key) == 0) {
+        return _netif_set_encrypt_key(dev, NETOPT_ENCRYPTION_KEY, value);
     }
 
     _set_usage(cmd_name);
@@ -680,19 +889,10 @@ static int _netif_flag(char *cmd, kernel_pid_t dev, char *flag)
 #ifdef MODULE_GNRC_IPV6_NETIF
 static uint8_t _get_prefix_len(char *addr)
 {
-    int prefix_len = SC_NETIF_IPV6_DEFAULT_PREFIX_LEN;
+    int prefix_len = ipv6_addr_split(addr, '/', SC_NETIF_IPV6_DEFAULT_PREFIX_LEN);
 
-    while ((*addr != '/') && (*addr != '\0')) {
-        addr++;
-    }
-
-    if (*addr == '/') {
-        *addr = '\0';
-        prefix_len = atoi(addr + 1);
-
-        if ((prefix_len < 1) || (prefix_len > IPV6_ADDR_BIT_LEN)) {
-            prefix_len = SC_NETIF_IPV6_DEFAULT_PREFIX_LEN;
-        }
+    if ((prefix_len < 1) || (prefix_len > IPV6_ADDR_BIT_LEN)) {
+        prefix_len = SC_NETIF_IPV6_DEFAULT_PREFIX_LEN;
     }
 
     return prefix_len;
@@ -709,7 +909,8 @@ static int _netif_add(char *cmd_name, kernel_pid_t dev, int argc, char **argv)
     } type = _UNICAST;
     char *addr_str = argv[0];
     ipv6_addr_t addr;
-    uint8_t prefix_len;
+    ipv6_addr_t *ifaddr;
+    uint8_t prefix_len, flags = 0;
 
     if (argc > 1) {
         if (strcmp(argv[0], "anycast") == 0) {
@@ -742,12 +943,23 @@ static int _netif_add(char *cmd_name, kernel_pid_t dev, int argc, char **argv)
         return 1;
     }
 
-    if (gnrc_ipv6_netif_add_addr(dev, &addr, prefix_len, (type == _ANYCAST) ?
-                                 GNRC_IPV6_NETIF_ADDR_FLAGS_NON_UNICAST :
-                                 GNRC_IPV6_NETIF_ADDR_FLAGS_UNICAST) == NULL) {
+    flags = GNRC_IPV6_NETIF_ADDR_FLAGS_NDP_AUTO;
+    if (type == _ANYCAST) {
+        flags |= GNRC_IPV6_NETIF_ADDR_FLAGS_NON_UNICAST;
+    }
+    else {
+        flags |= GNRC_IPV6_NETIF_ADDR_FLAGS_UNICAST;
+    }
+
+    if ((ifaddr = gnrc_ipv6_netif_add_addr(dev, &addr, prefix_len, flags)) == NULL) {
         printf("error: unable to add IPv6 address\n");
         return 1;
     }
+
+    /* Address shall be valid infinitely */
+    gnrc_ipv6_netif_addr_get(ifaddr)->valid = UINT32_MAX;
+    /* Address shall be preferred infinitely */
+    gnrc_ipv6_netif_addr_get(ifaddr)->preferred = UINT32_MAX;
 
     printf("success: added %s/%d to interface %" PRIkernel_pid "\n", addr_str,
            prefix_len, dev);
@@ -814,19 +1026,18 @@ static int _netif_mtu(kernel_pid_t dev, char *mtu_str)
 #endif
 }
 
-
 /* shell commands */
 int _netif_send(int argc, char **argv)
 {
     kernel_pid_t dev;
     uint8_t addr[MAX_ADDR_LEN];
     size_t addr_len;
-    gnrc_pktsnip_t *pkt;
+    gnrc_pktsnip_t *pkt, *hdr;
     gnrc_netif_hdr_t *nethdr;
     uint8_t flags = 0x00;
 
     if (argc < 4) {
-        printf("usage: %s <if> [<addr>|bcast] <data>\n", argv[0]);
+        printf("usage: %s <if> [<L2 addr>|bcast] <data>\n", argv[0]);
         return 1;
     }
 
@@ -853,15 +1064,22 @@ int _netif_send(int argc, char **argv)
 
     /* put packet together */
     pkt = gnrc_pktbuf_add(NULL, argv[3], strlen(argv[3]), GNRC_NETTYPE_UNDEF);
-    pkt = gnrc_pktbuf_add(pkt, NULL, sizeof(gnrc_netif_hdr_t) + addr_len,
-                          GNRC_NETTYPE_NETIF);
-    nethdr = (gnrc_netif_hdr_t *)pkt->data;
-    gnrc_netif_hdr_init(nethdr, 0, addr_len);
-    gnrc_netif_hdr_set_dst_addr(nethdr, addr, addr_len);
+    if (pkt == NULL) {
+        puts("error: packet buffer full");
+        return 1;
+    }
+    hdr = gnrc_netif_hdr_build(NULL, 0, addr, addr_len);
+    if (hdr == NULL) {
+        puts("error: packet buffer full");
+        gnrc_pktbuf_release(pkt);
+        return 1;
+    }
+    LL_PREPEND(pkt, hdr);
+    nethdr = (gnrc_netif_hdr_t *)hdr->data;
     nethdr->flags = flags;
     /* and send it */
     if (gnrc_netapi_send(dev, pkt) < 1) {
-        puts("error: unable to send\n");
+        puts("error: unable to send");
         gnrc_pktbuf_release(pkt);
         return 1;
     }
@@ -921,6 +1139,41 @@ int _netif_config(int argc, char **argv)
 
                 return _netif_mtu((kernel_pid_t)dev, argv[3]);
             }
+#ifdef MODULE_NETSTATS
+            else if (strcmp(argv[2], "stats") == 0) {
+                uint8_t module;
+                bool reset = false;
+
+                /* check for requested module */
+                if ((argc == 3) || (strcmp(argv[3], "all") == 0)) {
+                    module = NETSTATS_ALL;
+                }
+                else if (strcmp(argv[3], "l2") == 0) {
+                    module = NETSTATS_LAYER2;
+                }
+                else if (strcmp(argv[3], "ipv6") == 0) {
+                    module = NETSTATS_IPV6;
+                }
+                else {
+                    printf("Module %s doesn't exist or does not provide statistics.\n", argv[3]);
+
+                    return 0;
+                }
+
+                /* check if reset flag was given */
+                if ((argc > 4) && (strncmp(argv[4], "reset", 5) == 0)) {
+                    reset = true;
+                }
+                if (module & NETSTATS_LAYER2) {
+                    _netif_stats((kernel_pid_t) dev, NETSTATS_LAYER2, reset);
+                }
+                if (module & NETSTATS_IPV6) {
+                    _netif_stats((kernel_pid_t) dev, NETSTATS_IPV6, reset);
+                }
+
+                return 1;
+            }
+#endif
 #ifdef MODULE_GNRC_IPV6_NETIF
             else if (strcmp(argv[2], "hl") == 0) {
                 if (argc < 4) {
@@ -961,5 +1214,6 @@ int _netif_config(int argc, char **argv)
     _flag_usage(argv[0]);
     _add_usage(argv[0]);
     _del_usage(argv[0]);
+    _stats_usage(argv[0]);
     return 1;
 }
